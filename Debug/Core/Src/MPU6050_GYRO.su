@@ -1,0 +1,2 @@
+../Core/Src/MPU6050_GYRO.c:11:6:MPU6050_INIT	32	static
+../Core/Src/MPU6050_GYRO.c:27:6:MPU6050_GetData	48	static
