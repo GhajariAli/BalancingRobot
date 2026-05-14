@@ -12,7 +12,8 @@
 #include "sh2_SensorValue.h"
 #include "sh2_err.h"
 
-#define PWM_PIN GPIO_NUM_1        // moved from GPIO_NUM_2
+#define PWM_PIN GPIO_NUM_1        
+#define DIR_PIN GPIO_NUM_0
 #define RAMP_RATE_HZ_PER_SEC 20000
 
 static led_strip_handle_t strip;
@@ -21,6 +22,7 @@ static led_strip_handle_t strip;
 extern sh2_Hal_t *bno085_get_hal(void);
 static sh2_SensorValue_t imu_event;
 static volatile bool imu_event_ready = false;
+static bool motor_running = false;
 
 static void set_led_red(void) {
     led_strip_set_pixel(strip, 0, 10, 0, 0);
@@ -98,12 +100,62 @@ static void bno085_init(void) {
     printf("BNO085 ready\n");
 }
 
+// --- PID state (file-scope so app_main can adjust setpoint later) ---
+typedef struct {
+    float kp, ki, kd;
+    float setpoint;
+    float integral;
+    float prev_error;
+} pid_t;
+
+static pid_t pitch_pid = {
+    .kp = 10.0f,
+    .ki = 80.1f,
+    .kd = 50.00f,
+    .setpoint = 0.0f,   // target pitch in degrees
+    .integral = 0.0f,
+    .prev_error = 0.0f,
+};
+
+static float pid_update(pid_t *pid, float pv, float dt) {
+    float error      =  pid->setpoint - pv;
+    pid->integral   += error * dt;
+    float derivative = (error - pid->prev_error) / dt;
+    pid->prev_error  = error;
+
+    float out = pid->kp * error
+              + pid->ki * pid->integral
+              + pid->kd * derivative;
+
+    if (abs(out) < 500.0f) out = 0.0f;
+
+    else if (abs(out) > 26000.0f) {
+        if (out > 0) out = 26000.0f;
+        else out = -26000.0f;
+    }
+
+    return out;
+}
+// LEDC channel setup
+    ledc_channel_config_t channel = {
+        .gpio_num = PWM_PIN,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 500,
+        .hpoint = 0
+    };
+// --- updated imu_task ---
 static void imu_task(void *arg) {
     bno085_init();
+    TickType_t last_tick = xTaskGetTickCount();
+
     while (1) {
         sh2_service();
+
         if (imu_event_ready) {
             imu_event_ready = false;
+
             if (imu_event.sensorId == SH2_ROTATION_VECTOR) {
                 float roll, pitch, yaw;
                 quat_to_euler(
@@ -113,15 +165,44 @@ static void imu_task(void *arg) {
                     imu_event.un.rotationVector.k,
                     &roll, &pitch, &yaw
                 );
-                printf("Roll: %6.1f  Pitch: %6.1f  Yaw: %6.1f\n", roll, pitch, yaw);
+
+                TickType_t now = xTaskGetTickCount();
+                float dt = (now - last_tick) / (float)configTICK_RATE_HZ;
+                last_tick = now;
+                float mv = pid_update(&pitch_pid, pitch, dt);
+                if (mv> 0) {
+                    gpio_set_level(DIR_PIN, 0);
+                    mv = (mv > 26000.0f) ? 26000.0f : trunc(mv);
+                    if (!motor_running) ledc_channel_config(&channel); 
+                    ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, mv);
+                    motor_running=1;
+                } else if (mv < 0) {
+                    gpio_set_level(DIR_PIN, 1);
+                    mv = (-mv > 26000.0f) ? 26000.0f : -trunc(mv);
+                    if (!motor_running) ledc_channel_config(&channel); 
+                    ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, mv);
+                    motor_running=1;
+                }
+                else {
+                    motor_running=0;
+                    ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+                }
+                
+                printf("Pitch: %6.1f  MV: %6.0f \n", pitch, mv);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+
+        vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
 
 void app_main(void)
 {
+    gpio_config_t io = {
+    .pin_bit_mask = (1ULL << GPIO_NUM_0),
+    .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&io);
     // LED strip setup
     led_strip_config_t config = {
         .strip_gpio_num = 8,
@@ -144,97 +225,16 @@ void app_main(void)
     };
     ledc_timer_config(&timer);
 
-    // LEDC channel setup
-    ledc_channel_config_t channel = {
-        .gpio_num = PWM_PIN,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel = LEDC_CHANNEL_0,
-        .timer_sel = LEDC_TIMER_0,
-        .duty = 500,
-        .hpoint = 0
-    };
+    
     ledc_channel_config(&channel);
     ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
 
     xTaskCreate(imu_task, "imu_task", 4096, NULL, 1, NULL);
 
-    bool motor_on = false;
-    int current_freq = 500;
-
-    printf("Enter frequency (0 = off, 500-26000 Hz) and press Enter:\n");
-    printf("Ramp rate: %d Hz/sec\n", RAMP_RATE_HZ_PER_SEC);
-
-    char buf[32];
-    int pos = 0;
 
     while (1) {
-        // --- Service IMU ---
-        sh2_service();
+        
 
-        if (imu_event_ready) {
-            imu_event_ready = false;
-            if (imu_event.sensorId == SH2_ROTATION_VECTOR) {
-                float roll, pitch, yaw;
-                quat_to_euler(
-                    imu_event.un.rotationVector.real,
-                    imu_event.un.rotationVector.i,
-                    imu_event.un.rotationVector.j,
-                    imu_event.un.rotationVector.k,
-                    &roll, &pitch, &yaw
-                );
-                printf("Roll: %6.1f  Pitch: %6.1f  Yaw: %6.1f\n", roll, pitch, yaw);
-            }
-        }
 
-        // --- Handle serial input ---
-        int c = getchar();
-        if (c == EOF || c < 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
-        printf("%c", (char)c);
-
-        if (c == '\r' || c == '\n') {
-            printf("\n");
-            if (pos > 0) {
-                buf[pos] = '\0';
-                pos = 0;
-
-                int freq = atoi(buf);
-
-                if (freq == 0) {
-                    if (motor_on) {
-                        printf("Ramping down to stop...\n");
-                        set_freq_ramped(current_freq, 500);
-                        ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-                        motor_on = false;
-                        current_freq = 500;
-                        set_led_red();
-                    }
-                    printf("Motor off\n");
-
-                } else if (freq >= 500 && freq <= 26000) {
-                    if (!motor_on) {
-                        ledc_channel_config(&channel);
-                        ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, 500);
-                        motor_on = true;
-                        current_freq = 500;
-                        set_led_green();
-                    }
-                    printf("Ramping %s from %d to %d Hz at %d Hz/sec...\n",
-                           freq > current_freq ? "up" : "down",
-                           current_freq, freq, RAMP_RATE_HZ_PER_SEC);
-                    set_freq_ramped(current_freq, freq);
-                    current_freq = freq;
-                    printf("Done. Running at %d Hz\n", current_freq);
-
-                } else {
-                    printf("Out of range. Enter 0 or 500-26000.\n");
-                }
-            }
-        } else if (pos < (int)sizeof(buf) - 1) {
-            buf[pos++] = (char)c;
-        }
     }
 }
