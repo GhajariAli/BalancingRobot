@@ -109,9 +109,9 @@ typedef struct {
 } pid_t;
 
 static pid_t pitch_pid = {
-    .kp = 10.0f,
-    .ki = 80.1f,
-    .kd = 50.00f,
+    .kp = 1000.0f,
+    .ki = 100.0f,
+    .kd = 00.00f,
     .setpoint = 0.0f,   // target pitch in degrees
     .integral = 0.0f,
     .prev_error = 0.0f,
@@ -171,13 +171,13 @@ static void imu_task(void *arg) {
                 last_tick = now;
                 float mv = pid_update(&pitch_pid, pitch, dt);
                 if (mv> 0) {
-                    gpio_set_level(DIR_PIN, 0);
+                    gpio_set_level(DIR_PIN, 1);
                     mv = (mv > 26000.0f) ? 26000.0f : trunc(mv);
                     if (!motor_running) ledc_channel_config(&channel); 
                     ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, mv);
                     motor_running=1;
                 } else if (mv < 0) {
-                    gpio_set_level(DIR_PIN, 1);
+                    gpio_set_level(DIR_PIN, 0);
                     mv = (-mv > 26000.0f) ? 26000.0f : -trunc(mv);
                     if (!motor_running) ledc_channel_config(&channel); 
                     ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, mv);
@@ -192,7 +192,7 @@ static void imu_task(void *arg) {
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(25));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
