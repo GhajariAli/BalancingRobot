@@ -1,40 +1,31 @@
 // Cubli-style reaction-wheel balancer — ESP32-C3 + BNO085 + Nidec 24H BLDC
 // ----------------------------------------------------------------------------
 //
-// Control approach: SIGNED output with direction reversal at zero.
+// Control approach: DIRECTION FLIPPING with BRAKE-ASSISTED transitions.
 //
-//   u = K_P * (pitch - setpoint) + K_D * pitch_rate     (signed, Hz)
+//   desired_accel = K_P * pitch_err + K_D * pitch_rate - K_OMEGA * wheel_signed
+//   desired_signed += desired_accel * dt                      (signed Hz)
 //
-//   |u| < DEADBAND     -> stay at FREQ_MIN in current direction (no flip)
-//   sign(u) == dir     -> slew commanded freq toward |u|, clamped
-//   sign(u) != dir     -> slew freq down to FREQ_MIN, dwell so the rotor can
-//                         coast (no BRAKE wired), toggle F/R, then ramp up
-//                         to |u| in the new direction
+//   sign(desired_signed) selects motor direction via F/R.
+//   |desired_signed| sets the magnitude commanded on the LEDC clock input.
 //
-// Architecture:
+//   When sign(desired_signed) differs from current motor direction, the slew
+//   task engages BRAKE to drop the rotor fast, dwells briefly so the rotor
+//   actually stops, toggles F/R, releases BRAKE, then ramps up in the new
+//   direction. With BRAKE wired, this transition is short instead of the
+//   ~450 ms coast-down we had before.
 //
-//   imu_task     : owns SH-2, decodes rotation vector + calibrated gyro
-//                  inside the event handler (so no events are lost when
-//                  multiple reports arrive in one service call)
+//   K_OMEGA bleeds signed wheel speed toward zero so the wheel doesn't
+//   accumulate unbounded momentum.
 //
-//   slew_task    : 10 ms tick. State machine that tracks (current_dir,
-//                  current_freq) and rate-limits frequency changes to
-//                  SLEW_HZ_PER_SEC. Owns the direction-flip sequence.
-//
-//   control_task : 10 ms tick (100 Hz). In BALANCE mode reads pitch +
-//                  pitch_rate, computes signed u, writes desired_signed.
-//                  Runs safety clamps (tilt magnitude, IMU staleness).
-//
-//   app_main     : sets up LEDC/F/R/LED, spawns tasks, runs UART:
-//                     0          -> motor off (ramp down, then stop)
-//                     <number>   -> MANUAL forward at that freq
-//                     -<number>  -> MANUAL reverse at that freq
-//                     b          -> arm BALANCE mode
-//                     s          -> print status
-//
-// Tuning: K_P, K_D, DEADBAND_HZ, and the direction-flip dwell are the
-// knobs that matter. If the motor faults during flips, raise FLIP_DWELL
-// or lower DIR_FLIP_FREQ.
+// UART:
+//   0          motor OFF
+//   <number>   MANUAL: positive = forward, negative = reverse
+//   b          arm BALANCE mode
+//   s          status / g  gains+knobs
+//   p,d,w,c    K_P, K_D, K_OMEGA, pitch setpoint
+//   r,z,f      slew rate, deadband, flip dwell
+//   x <0|1>    manual brake override (for hardware testing)
 // ----------------------------------------------------------------------------
 
 #include <stdio.h>
@@ -56,35 +47,49 @@
 
 // ===== Pin map =============================================================
 #define PWM_PIN              GPIO_NUM_1
-#define FR_PIN               GPIO_NUM_0    // Nidec F/R; HIGH = reverse
+#define FR_PIN               GPIO_NUM_0    // Nidec F/R
+#define BRAKE_PIN            GPIO_NUM_10   // Nidec BRAKE (active LOW typical)
 #define LED_PIN              8
 
-// F/R pin level for "forward" direction. If on bench the directions are
-// inverted (corrective torque points the wrong way for positive pitch), flip
-// this from 0 to 1.
+// F/R level for "forward". If on bench positive desired pushes the body the
+// wrong way, flip this (or invert the sign of K_P).
 #define FR_FORWARD_LEVEL     0
+
+// BRAKE polarity. If `x1` does nothing (or vice versa), flip these.
+#define BRAKE_ENGAGED_LEVEL  0
+#define BRAKE_RELEASED_LEVEL 1
 
 // ===== Motor frequency limits =============================================
 #define FREQ_MIN             500
 #define FREQ_MAX             26000
-#define SLEW_HZ_PER_SEC      50000         // max rate of frequency change.
-                                           // Lower if motor loses sync.
-#define SLEW_TICK_MS         10            // slew task period (= 1 tick at
-                                           // CONFIG_FREERTOS_HZ=100)
+#define SLEW_TICK_MS         10            // = 1 tick at FREERTOS_HZ=100
 
-// ===== Direction flip behavior ===========================================
-#define DEADBAND_HZ          300           // |u| below this -> idle, no flip
-#define DIR_FLIP_FREQ        700           // F/R toggled only when current
-                                           // commanded freq is at or below this
-#define FLIP_DWELL_TICKS     2             // wait this many ticks (20 ms) at
-                                           // low freq before toggling F/R, so
-                                           // the rotor has time to coast down
+// Live-tunable motor knobs (UART: r, z, f, m, a). Power-on defaults.
+#define SLEW_HZ_PER_SEC_DEFAULT  20000     // max rate of frequency change
+#define DEADBAND_HZ_DEFAULT      200       // |desired| below this -> idle/no flip
+#define FLIP_DWELL_TICKS_DEFAULT 3         // ticks at low freq before F/R toggle
+                                           // (~30 ms with brake engaged)
+#define DIR_FLIP_FREQ            FREQ_MIN  // brake until this freq, then flip F/R
+
+// Anti-windup: integrator can lead the motor's actual speed by at most this
+// many Hz. Prevents the integrator from racing ahead during slewing.
+#define ANTIWINDUP_LEAD_HZ_DEFAULT  5000
+
+// Direction-flip debounce: refuse a new F/R flip within this many ms of the
+// last one. Protects the Nidec ESC from rapid reversals that can latch a
+// fault. Set 0 to disable.
+#define FLIP_MIN_INTERVAL_MS_DEFAULT 150
 
 // ===== Control gains =====================================================
-#define CTRL_LOOP_MS         10            // 100 Hz
-#define CTRL_K_P             400.0f        // Hz per degree of tilt
-#define CTRL_K_D             50.0f         // Hz per (deg/sec) of pitch rate
-#define CTRL_PITCH_SETPOINT  0.0f          // degrees; calibrate to upright
+// Acceleration-based law:
+//   desired_accel = K_P * pitch_err + K_D * pitch_rate - K_OMEGA * wheel_signed
+//   desired_signed += desired_accel * dt
+// Gains in Hz/sec units.
+#define CTRL_LOOP_MS             10        // 100 Hz
+#define CTRL_K_P_DEFAULT         2000.0f   // (Hz/s) per degree of tilt
+#define CTRL_K_D_DEFAULT         200.0f    // (Hz/s) per (deg/s) of pitch rate
+#define CTRL_K_OMEGA_DEFAULT     0.3f      // 1/s; wheel-speed decay rate
+#define CTRL_SETPOINT_DEFAULT    0.0f      // degrees; calibrate to upright
 
 // ===== Safety =============================================================
 #define CTRL_TILT_MAX_DEG    30.0f
@@ -109,10 +114,25 @@ typedef enum { MODE_OFF = 0, MODE_MANUAL, MODE_BALANCE } mode_t;
 typedef enum { DIR_FORWARD = 0, DIR_REVERSE = 1 }        dir_t;
 
 static volatile mode_t s_mode            = MODE_OFF;
-static volatile float  s_desired_signed  = 0.0f;     // signed Hz from control
+static volatile float  s_desired         = 0.0f;     // signed Hz (controller out)
 static volatile int    s_current_freq    = FREQ_MIN; // unsigned magnitude
 static volatile dir_t  s_current_dir     = DIR_FORWARD;
 static volatile bool   s_motor_armed     = false;
+static volatile bool   s_brake_active    = false;
+
+// Live-tunable gains
+static volatile float  g_kp        = CTRL_K_P_DEFAULT;
+static volatile float  g_kd        = CTRL_K_D_DEFAULT;
+static volatile float  g_komega    = CTRL_K_OMEGA_DEFAULT;
+static volatile float  g_setpoint  = CTRL_SETPOINT_DEFAULT;
+
+// Live-tunable motor knobs
+static volatile int    g_slew_hz           = SLEW_HZ_PER_SEC_DEFAULT;
+static volatile int    g_deadband_hz       = DEADBAND_HZ_DEFAULT;
+static volatile int    g_flip_dwell        = FLIP_DWELL_TICKS_DEFAULT;
+static volatile int    g_antiwindup_hz     = ANTIWINDUP_LEAD_HZ_DEFAULT;
+static volatile int    g_flip_min_interval_ms = FLIP_MIN_INTERVAL_MS_DEFAULT;
+static volatile uint32_t s_last_flip_us    = 0;
 
 // ===========================================================================
 // LED helpers
@@ -139,10 +159,18 @@ static int fr_level_for(dir_t d) {
     return (d == DIR_FORWARD) ? FR_FORWARD_LEVEL : (FR_FORWARD_LEVEL ^ 1);
 }
 
-static void set_desired_signed(float u_hz) {
+static void set_desired(float v) {
     portENTER_CRITICAL(&state_mux);
-    s_desired_signed = u_hz;
+    s_desired = v;
     portEXIT_CRITICAL(&state_mux);
+}
+
+// Idempotent — safe to call every tick.
+static void brake_set(bool engaged) {
+    if (engaged == s_brake_active) return;
+    s_brake_active = engaged;
+    gpio_set_level(BRAKE_PIN,
+                   engaged ? BRAKE_ENGAGED_LEVEL : BRAKE_RELEASED_LEVEL);
 }
 
 // ===========================================================================
@@ -160,8 +188,8 @@ static void motor_hw_start(void) {
     ledc_channel_config(&channel);
     ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, FREQ_MIN);
     portENTER_CRITICAL(&state_mux);
-    s_current_freq   = FREQ_MIN;
-    s_desired_signed = 0.0f;
+    s_current_freq = FREQ_MIN;
+    s_desired      = 0.0f;
     portEXIT_CRITICAL(&state_mux);
     s_motor_armed = true;
 }
@@ -171,20 +199,24 @@ static void motor_hw_stop(void) {
     s_motor_armed = false;
 }
 
-// Non-blocking slew + direction state machine.
-// Runs every SLEW_TICK_MS. Owns ledc_set_freq and the F/R pin.
+// Slew task: state machine that owns ledc_set_freq, the F/R pin, and BRAKE
+// during direction-change transitions. Per tick:
+//   1) Decide desired direction + magnitude from signed s_desired.
+//   2) If direction matches current_dir, slew toward magnitude.
+//   3) Else: brake on, ramp current_freq down to FREQ_MIN, dwell, flip F/R,
+//      brake off, then start ramping toward new magnitude.
 static void slew_task(void *arg) {
-    const int step = (SLEW_HZ_PER_SEC * SLEW_TICK_MS) / 1000;
     int dwell = 0;
+    bool in_flip = false;
 
     while (1) {
-        float    u;
+        float    desired;
         dir_t    cur_dir;
         int      cur_freq;
         mode_t   mode;
         bool     armed;
         portENTER_CRITICAL(&state_mux);
-        u        = s_desired_signed;
+        desired  = s_desired;
         cur_dir  = s_current_dir;
         cur_freq = s_current_freq;
         mode     = s_mode;
@@ -192,46 +224,69 @@ static void slew_task(void *arg) {
         portEXIT_CRITICAL(&state_mux);
 
         if (!armed) {
+            in_flip = false;
+            dwell   = 0;
             vTaskDelay(pdMS_TO_TICKS(SLEW_TICK_MS));
             continue;
         }
 
-        // ----- decide desired direction + magnitude from signed u -----
+        // Recompute step each tick — slew rate is live-tunable.
+        int step = (g_slew_hz * SLEW_TICK_MS) / 1000;
+        if (step < 1) step = 1;
+
+        // ----- desired direction + magnitude from signed command -----
         dir_t want_dir;
         int   want_mag;
-        if (fabsf(u) < DEADBAND_HZ) {
-            // Small command: hold current direction, idle at FREQ_MIN.
-            // No flip while we're inside the deadband.
+        if (fabsf(desired) < (float)g_deadband_hz) {
+            // Small command: stay in current direction at FREQ_MIN. No flip.
             want_dir = cur_dir;
             want_mag = FREQ_MIN;
         } else {
-            want_dir = (u > 0.0f) ? DIR_FORWARD : DIR_REVERSE;
-            want_mag = clamp_freq((int)fabsf(u));
+            want_dir = (desired > 0.0f) ? DIR_FORWARD : DIR_REVERSE;
+            want_mag = clamp_freq((int)fabsf(desired));
         }
 
-        // ----- pick slew target this tick -----
+        // ----- target this tick + brake state -----
+        // Flip debounce: if we just completed a flip recently, refuse a new
+        // one. Protects the Nidec ESC from latching a fault from too-rapid
+        // direction reversals.
+        uint32_t now_us = (uint32_t)esp_timer_get_time();
+        bool flip_allowed = !s_last_flip_us ||
+            ((now_us - s_last_flip_us) >= (uint32_t)g_flip_min_interval_ms * 1000);
+
         int target;
-        if (want_dir != cur_dir) {
-            // Direction reversal pending. First ramp down to flip-safe freq.
-            target = FREQ_MIN;
+        if ((want_dir != cur_dir && flip_allowed) || in_flip) {
+            // Direction-flip sequence.
+            in_flip = true;
+            target  = FREQ_MIN;
+            brake_set(true);   // active brake — rotor drops fast
             if (cur_freq <= DIR_FLIP_FREQ) {
                 dwell++;
-                if (dwell >= FLIP_DWELL_TICKS) {
-                    // Rotor has had time to coast — flip F/R now.
+                if (dwell >= g_flip_dwell) {
+                    // Rotor is stopped (or close). Flip F/R, release brake,
+                    // exit flip state. Next tick begins ramp-up.
                     gpio_set_level(FR_PIN, fr_level_for(want_dir));
                     portENTER_CRITICAL(&state_mux);
                     s_current_dir = want_dir;
                     portEXIT_CRITICAL(&state_mux);
                     cur_dir = want_dir;
-                    dwell = 0;
-                    // Next iteration will start ramping up to want_mag.
+                    brake_set(false);
+                    in_flip = false;
+                    dwell   = 0;
+                    s_last_flip_us = now_us;   // arm the debounce window
                 }
             } else {
                 dwell = 0;
             }
+        } else if (want_dir != cur_dir) {
+            // Flip wanted but debounced. Hold at FREQ_MIN in current dir
+            // (no brake — let motor coast). When debounce window expires,
+            // a flip will be allowed on a subsequent tick.
+            target = FREQ_MIN;
+            brake_set(false);
         } else {
             target = want_mag;
-            dwell = 0;
+            brake_set(false);
         }
 
         // ----- slew current_freq toward target -----
@@ -251,8 +306,8 @@ static void slew_task(void *arg) {
             cur_freq = new_freq;
         }
 
-        // OFF mode: once we've slewed all the way down, kill LEDC.
-        if (mode == MODE_OFF && cur_freq <= FREQ_MIN) {
+        if (mode == MODE_OFF && cur_freq <= FREQ_MIN && !in_flip) {
+            brake_set(false);
             motor_hw_stop();
         }
 
@@ -268,9 +323,6 @@ extern sh2_Hal_t *bno085_get_hal(void);
 static void quat_to_euler(float r, float i, float j, float k,
                           float *roll, float *pitch, float *yaw);
 
-// Decode + state write happen inside the SH-2 handler (runs in imu_task's
-// context via sh2_service). This way we never lose a sample when rotation
-// vector and gyro events arrive in the same service call.
 static void imu_event_handler(void *cookie, sh2_SensorEvent_t *event) {
     sh2_SensorValue_t v;
     sh2_decodeSensorEvent(&v, event);
@@ -290,6 +342,8 @@ static void imu_event_handler(void *cookie, sh2_SensorEvent_t *event) {
         s_imu_ready   = true;
         portEXIT_CRITICAL(&state_mux);
     } else if (v.sensorId == SH2_GYROSCOPE_CALIBRATED) {
+        // Kept for completeness; control_task computes its own rate from
+        // numerical derivative of pitch (more robust to mount orientation).
         float rate_dps = v.un.gyroscope.y * (180.0f / (float)M_PI);
         portENTER_CRITICAL(&state_mux);
         s_pitch_rate_dps = rate_dps;
@@ -326,7 +380,6 @@ static void bno085_init(void) {
     printf("BNO085 ready\n");
 }
 
-// imu_task owns SH-2 exclusively. Nothing else may call sh2_service().
 static void imu_task(void *arg) {
     bno085_init();
     while (1) {
@@ -336,25 +389,51 @@ static void imu_task(void *arg) {
 }
 
 // ===========================================================================
-// Control task — the PD law producing signed Hz
+// Control task — acceleration-based PD with wheel-speed feedback
 // ===========================================================================
 static void control_task(void *arg) {
     TickType_t last_wake = xTaskGetTickCount();
-    int print_div = 0;
+    int   print_div = 0;
+    float prev_pitch = 0.0f;
+    float rate_filt  = 0.0f;
+    bool  rate_init  = false;
+
     while (1) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CTRL_LOOP_MS));
 
-        float    pitch, pitch_rate;
+        float    pitch;
         uint32_t last_us;
         bool     ready;
         mode_t   mode;
+        int      cur_freq;
+        dir_t    cur_dir;
         portENTER_CRITICAL(&state_mux);
-        pitch      = s_pitch_deg;
-        pitch_rate = s_pitch_rate_dps;
-        last_us    = s_last_imu_us;
-        ready      = s_imu_ready;
-        mode       = s_mode;
+        pitch    = s_pitch_deg;
+        last_us  = s_last_imu_us;
+        ready    = s_imu_ready;
+        mode     = s_mode;
+        cur_freq = s_current_freq;
+        cur_dir  = s_current_dir;
         portEXIT_CRITICAL(&state_mux);
+
+        // ----- pitch rate via numerical derivative + 1st-order lowpass -----
+        const float dt_ctrl = CTRL_LOOP_MS / 1000.0f;
+        const float alpha   = 0.4f;
+        float pitch_rate = 0.0f;
+        if (ready) {
+            if (!rate_init) {
+                prev_pitch = pitch;
+                rate_filt  = 0.0f;
+                rate_init  = true;
+            } else {
+                float rate_raw = (pitch - prev_pitch) / dt_ctrl;
+                rate_filt  = alpha * rate_raw + (1.0f - alpha) * rate_filt;
+                pitch_rate = rate_filt;
+                prev_pitch = pitch;
+            }
+        } else {
+            rate_init = false;
+        }
 
         if (mode != MODE_BALANCE) continue;
 
@@ -366,7 +445,7 @@ static void control_task(void *arg) {
         if (!ready || age_us > CTRL_FRESH_US) {
             safe_fault = true;
             printf("[SAFE] IMU stale (%lu us)\n", (unsigned long)age_us);
-        } else if (fabsf(pitch - CTRL_PITCH_SETPOINT) > CTRL_TILT_MAX_DEG) {
+        } else if (fabsf(pitch - g_setpoint) > CTRL_TILT_MAX_DEG) {
             safe_fault = true;
             printf("[SAFE] Tilt %.1f deg exceeds limit\n", (double)pitch);
         }
@@ -374,23 +453,45 @@ static void control_task(void *arg) {
             portENTER_CRITICAL(&state_mux);
             s_mode = MODE_OFF;
             portEXIT_CRITICAL(&state_mux);
-            set_desired_signed(0.0f);
+            set_desired(0.0f);
+            brake_set(false);
             led_red();
             continue;
         }
 
-        // ----- PD law (signed) -----
-        float err = pitch - CTRL_PITCH_SETPOINT;
-        float u   = CTRL_K_P * err + CTRL_K_D * pitch_rate;
-        set_desired_signed(u);
+        // ----- Acceleration law on signed wheel speed -----
+        float wheel_signed = (float)cur_freq *
+                             ((cur_dir == DIR_FORWARD) ? 1.0f : -1.0f);
 
-        // Sparse telemetry every 100 ms
+        float err   = pitch - g_setpoint;
+        float accel = g_kp * err
+                    + g_kd * pitch_rate
+                    - g_komega * wheel_signed;
+
+        float new_desired = s_desired + accel * dt_ctrl;
+
+        // Anti-windup: don't let the integrator lead the motor's actual
+        // (signed) speed by more than g_antiwindup_hz. This is what keeps
+        // the integrator from racing into saturation while the motor is
+        // still slewing or transitioning direction.
+        float aw = (float)g_antiwindup_hz;
+        float upper = wheel_signed + aw;
+        float lower = wheel_signed - aw;
+        if (new_desired > upper) new_desired = upper;
+        if (new_desired < lower) new_desired = lower;
+
+        // Absolute clamp to motor range
+        if (new_desired >  (float)FREQ_MAX) new_desired =  (float)FREQ_MAX;
+        if (new_desired < -(float)FREQ_MAX) new_desired = -(float)FREQ_MAX;
+        set_desired(new_desired);
+
         if (++print_div >= 10) {
             print_div = 0;
-            const char *dname = (s_current_dir == DIR_FORWARD) ? "FWD" : "REV";
-            printf("BAL pitch=%6.2f rate=%7.2f u=%8.1f dir=%s cur=%5d\n",
-                   (double)pitch, (double)pitch_rate, (double)u,
-                   dname, s_current_freq);
+            const char *dname = (cur_dir == DIR_FORWARD) ? "FWD" : "REV";
+            printf("BAL pitch=%6.2f rate=%7.2f accel=%8.1f des=%+7.1f dir=%s cur=%5d brk=%c\n",
+                   (double)pitch, (double)pitch_rate, (double)accel,
+                   (double)new_desired, dname, cur_freq,
+                   s_brake_active ? '1' : '0');
         }
     }
 }
@@ -402,22 +503,27 @@ static void enter_off(void) {
     portENTER_CRITICAL(&state_mux);
     s_mode = MODE_OFF;
     portEXIT_CRITICAL(&state_mux);
-    set_desired_signed(0.0f);   // slew_task ramps to FREQ_MIN, then stops LEDC
+    set_desired(0.0f);
+    brake_set(false);
     led_red();
     printf("[MODE] OFF (ramping down)\n");
 }
 
-// Positive freq = FORWARD, negative freq = REVERSE. Useful for testing
-// the F/R wiring without entering BALANCE mode.
+// MANUAL: positive = forward, negative = reverse. Useful for hardware tests.
 static void enter_manual(int signed_freq) {
+    int mag = abs(signed_freq);
+    if (mag < FREQ_MIN || mag > FREQ_MAX) {
+        printf("Out of range. +/-%d..%d.\n", FREQ_MIN, FREQ_MAX);
+        return;
+    }
     if (!s_motor_armed) motor_hw_start();
     portENTER_CRITICAL(&state_mux);
     s_mode = MODE_MANUAL;
     portEXIT_CRITICAL(&state_mux);
-    set_desired_signed((float)signed_freq);
+    set_desired((float)signed_freq);
     led_blue();
     printf("[MODE] MANUAL target=%d (%s)\n",
-           abs(signed_freq), signed_freq >= 0 ? "FWD" : "REV");
+           mag, signed_freq >= 0 ? "FWD" : "REV");
 }
 
 static void enter_balance(void) {
@@ -429,20 +535,29 @@ static void enter_balance(void) {
     portENTER_CRITICAL(&state_mux);
     s_mode = MODE_BALANCE;
     portEXIT_CRITICAL(&state_mux);
-    set_desired_signed(0.0f);
+    set_desired(0.0f);
+    brake_set(false);
     led_green();
-    printf("[MODE] BALANCE armed (Kp=%.1f Kd=%.1f deadband=%d)\n",
-           (double)CTRL_K_P, (double)CTRL_K_D, DEADBAND_HZ);
+    printf("[MODE] BALANCE armed (Kp=%.1f Kd=%.1f Kw=%.3f setpoint=%.2f)\n",
+           (double)g_kp, (double)g_kd, (double)g_komega, (double)g_setpoint);
+}
+
+static void print_gains(void) {
+    printf("[GAINS] Kp=%.2f Kd=%.2f Kw=%.4f setpoint=%.3f deg\n",
+           (double)g_kp, (double)g_kd, (double)g_komega, (double)g_setpoint);
+    printf("[MOTOR] slew=%d Hz/s  deadband=%d Hz  flip_dwell=%d ticks (%d ms)\n",
+           g_slew_hz, g_deadband_hz, g_flip_dwell, g_flip_dwell * SLEW_TICK_MS);
+    printf("[SAFE]  antiwindup=%d Hz  flip_interval=%d ms\n",
+           g_antiwindup_hz, g_flip_min_interval_ms);
 }
 
 static void print_status(void) {
     const char *mname = (s_mode == MODE_OFF) ? "OFF"
                       : (s_mode == MODE_MANUAL) ? "MANUAL" : "BALANCE";
     const char *dname = (s_current_dir == DIR_FORWARD) ? "FWD" : "REV";
-    printf("[STATUS] mode=%s armed=%d dir=%s cur=%d u=%.1f pitch=%.2f rate=%.2f\n",
+    printf("[STATUS] mode=%s armed=%d dir=%s cur=%d des=%+.1f brk=%d pitch=%.2f\n",
            mname, (int)s_motor_armed, dname, s_current_freq,
-           (double)s_desired_signed, (double)s_pitch_deg,
-           (double)s_pitch_rate_dps);
+           (double)s_desired, (int)s_brake_active, (double)s_pitch_deg);
 }
 
 // ===========================================================================
@@ -462,7 +577,7 @@ void app_main(void)
     led_strip_new_rmt_device(&led_cfg, &rmt_cfg, &strip);
     led_red();
 
-    // --- F/R pin: forward at boot ---
+    // --- F/R pin ---
     gpio_config_t fr_io = {
         .pin_bit_mask = (1ULL << FR_PIN),
         .mode = GPIO_MODE_OUTPUT,
@@ -471,7 +586,16 @@ void app_main(void)
     gpio_set_level(FR_PIN, FR_FORWARD_LEVEL);
     s_current_dir = DIR_FORWARD;
 
-    // --- LEDC timer (channel attached on motor_hw_start) ---
+    // --- BRAKE pin: released at boot ---
+    gpio_config_t brake_io = {
+        .pin_bit_mask = (1ULL << BRAKE_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&brake_io);
+    gpio_set_level(BRAKE_PIN, BRAKE_RELEASED_LEVEL);
+    s_brake_active = false;
+
+    // --- LEDC timer ---
     ledc_timer_config_t timer = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .timer_num       = LEDC_TIMER_0,
@@ -486,11 +610,23 @@ void app_main(void)
     xTaskCreate(slew_task,    "slew",    2048, NULL, 6, NULL);
     xTaskCreate(control_task, "control", 4096, NULL, 4, NULL);
 
-    printf("Cubli balancer ready.\n");
-    printf("  <number>  MANUAL freq, positive=forward, negative=reverse\n");
+    printf("Cubli balancer ready (direction-flip + brake).\n");
+    printf("  <number>  MANUAL freq, +ve=FWD, -ve=REV (e.g. 1500, -1500)\n");
     printf("  0         motor OFF\n");
     printf("  b         arm BALANCE mode\n");
     printf("  s         print status\n");
+    printf("  g         print gains and motor knobs\n");
+    printf("  p <num>   set K_P     in (Hz/s)/deg     (e.g. p 2000)\n");
+    printf("  d <num>   set K_D     in (Hz/s)/(deg/s) (e.g. d 200)\n");
+    printf("  w <num>   set K_OMEGA in 1/s            (e.g. w 0.3)\n");
+    printf("  c <num>   set pitch setpoint in deg     (e.g. c 1.7)\n");
+    printf("  r <num>   set slew rate in Hz/sec       (e.g. r 20000)\n");
+    printf("  z <num>   set deadband in Hz            (e.g. z 200)\n");
+    printf("  f <num>   set flip dwell in ticks       (e.g. f 3)\n");
+    printf("  x <0|1>   manual brake (1=engage, 0=release)\n");
+    printf("  a <num>   anti-windup lead in Hz         (e.g. a 5000)\n");
+    printf("  m <num>   min ms between F/R flips       (e.g. m 150)\n");
+    print_gains();
 
     // --- UART command loop ---
     char buf[32];
@@ -512,18 +648,95 @@ void app_main(void)
                 enter_balance();
             } else if (buf[0] == 's' || buf[0] == 'S') {
                 print_status();
+            } else if (buf[0] == 'g' || buf[0] == 'G') {
+                print_gains();
+            } else if (buf[0] == 'p' || buf[0] == 'P') {
+                float v;
+                if (sscanf(buf + 1, "%f", &v) == 1 && v >= 0.0f && v < 50000.0f) {
+                    g_kp = v;
+                    printf("K_P = %.2f\n", (double)v);
+                } else {
+                    printf("Usage: p <number>  (0 .. 50000)\n");
+                }
+            } else if (buf[0] == 'd' || buf[0] == 'D') {
+                float v;
+                if (sscanf(buf + 1, "%f", &v) == 1 && v >= 0.0f && v < 50000.0f) {
+                    g_kd = v;
+                    printf("K_D = %.2f\n", (double)v);
+                } else {
+                    printf("Usage: d <number>  (0 .. 50000)\n");
+                }
+            } else if (buf[0] == 'c' || buf[0] == 'C') {
+                float v;
+                if (sscanf(buf + 1, "%f", &v) == 1 && fabsf(v) <= 45.0f) {
+                    g_setpoint = v;
+                    printf("setpoint = %.3f deg\n", (double)v);
+                } else {
+                    printf("Usage: c <number>  (-45 .. 45 degrees)\n");
+                }
+            } else if (buf[0] == 'w' || buf[0] == 'W') {
+                float v;
+                if (sscanf(buf + 1, "%f", &v) == 1 && v >= 0.0f && v < 100.0f) {
+                    g_komega = v;
+                    printf("K_OMEGA = %.4f\n", (double)v);
+                } else {
+                    printf("Usage: w <number>  (0 .. 100)\n");
+                }
+            } else if (buf[0] == 'r' || buf[0] == 'R') {
+                int v;
+                if (sscanf(buf + 1, "%d", &v) == 1 && v >= 1000 && v <= 200000) {
+                    g_slew_hz = v;
+                    printf("slew = %d Hz/s\n", v);
+                } else {
+                    printf("Usage: r <number>  (1000 .. 200000 Hz/sec)\n");
+                }
+            } else if (buf[0] == 'z' || buf[0] == 'Z') {
+                int v;
+                if (sscanf(buf + 1, "%d", &v) == 1 && v >= 0 && v <= 5000) {
+                    g_deadband_hz = v;
+                    printf("deadband = %d Hz\n", v);
+                } else {
+                    printf("Usage: z <number>  (0 .. 5000 Hz)\n");
+                }
+            } else if (buf[0] == 'f' || buf[0] == 'F') {
+                int v;
+                if (sscanf(buf + 1, "%d", &v) == 1 && v >= 0 && v <= 100) {
+                    g_flip_dwell = v;
+                    printf("flip dwell = %d ticks (%d ms)\n", v, v * SLEW_TICK_MS);
+                } else {
+                    printf("Usage: f <number>  (0 .. 100 ticks)\n");
+                }
+            } else if (buf[0] == 'x' || buf[0] == 'X') {
+                int v;
+                if (sscanf(buf + 1, "%d", &v) == 1 && (v == 0 || v == 1)) {
+                    brake_set(v != 0);
+                    printf("brake = %s (manual override)\n",
+                           v ? "ENGAGED" : "RELEASED");
+                } else {
+                    printf("Usage: x <0|1>\n");
+                }
+            } else if (buf[0] == 'a' || buf[0] == 'A') {
+                int v;
+                if (sscanf(buf + 1, "%d", &v) == 1 && v >= 100 && v <= 50000) {
+                    g_antiwindup_hz = v;
+                    printf("anti-windup = %d Hz\n", v);
+                } else {
+                    printf("Usage: a <number>  (100 .. 50000 Hz)\n");
+                }
+            } else if (buf[0] == 'm' || buf[0] == 'M') {
+                int v;
+                if (sscanf(buf + 1, "%d", &v) == 1 && v >= 0 && v <= 2000) {
+                    g_flip_min_interval_ms = v;
+                    printf("flip min interval = %d ms\n", v);
+                } else {
+                    printf("Usage: m <number>  (0 .. 2000 ms; 0 disables)\n");
+                }
             } else if (buf[0] == '-' || isdigit((unsigned char)buf[0])) {
                 int freq = atoi(buf);
                 if (freq == 0) {
                     enter_off();
                 } else {
-                    int mag = abs(freq);
-                    if (mag >= FREQ_MIN && mag <= FREQ_MAX) {
-                        enter_manual(freq);
-                    } else {
-                        printf("Out of range. 0 or +/-%d..%d.\n",
-                               FREQ_MIN, FREQ_MAX);
-                    }
+                    enter_manual(freq);
                 }
             } else {
                 printf("Unknown command: %s\n", buf);
